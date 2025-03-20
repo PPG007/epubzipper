@@ -26,3 +26,10 @@ customize image resize ratio, which is default to 0.5:
 ```shell
 epubzipper -s input.epub -r 0.1
 ```
+
+process files concurrently(from v1.1):
+
+```shell
+# use 4 goroutines
+epubzipper -s library -c 4
+```

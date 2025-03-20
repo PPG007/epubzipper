@@ -4,8 +4,9 @@ import (
 	"archive/zip"
 	"errors"
 	"fmt"
+	"fortio.org/progressbar"
 	"github.com/disintegration/imaging"
-	"github.com/schollz/progressbar/v3"
+	"github.com/panjf2000/ants/v2"
 	"github.com/spf13/cobra"
 	"image"
 	"io"
@@ -14,13 +15,16 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 var (
-	src           string
-	out           string
-	ratio         float64
-	newFileSuffix = "_zipped"
+	src             string
+	out             string
+	ratio           float64
+	newFileSuffix   = "_zipped"
+	concurrency     int
+	maxPrefixLength = 15
 )
 
 var rootCmd = &cobra.Command{
@@ -38,27 +42,72 @@ var rootCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		var files []string
-		if srcInfo.IsDir() {
-			entries, err := os.ReadDir(srcPath)
+		files, err := getFiles(srcPath, srcInfo)
+		if err != nil {
+			return err
+		}
+		if len(files) == 0 {
+			return errors.New("no files found")
+		}
+		wg := &sync.WaitGroup{}
+		pool, err := ants.NewPool(concurrency)
+		if err != nil {
+			return err
+		}
+		defer pool.Release()
+		fmt.Println(progressbar.ClearAfter)
+		cfg := progressbar.DefaultConfig()
+		cfg.ScreenWriter = os.Stdout
+		cfg.UpdateInterval = 0
+		cfg.ExtraLines = 1
+		multiBar := cfg.NewMultiBarPrefixes(formatPrefix(strings.TrimLeft(files[0], path.Dir(files[0]))))
+		multiBar.PrefixesAlign()
+		firstBar := multiBar.Bars[0]
+		defer func() {
+			multiBar.End()
+		}()
+		for i, file := range files {
+			temp := file
+			index := i
+			wg.Add(1)
+			err = pool.Submit(func() {
+				defer wg.Done()
+				prefix := formatPrefix(strings.TrimLeft(temp, path.Dir(temp)))
+				cfg.Prefix = prefix
+				var subBar *progressbar.Bar
+				if index == 0 {
+					subBar = firstBar
+				} else {
+					subBar = cfg.NewBar()
+					multiBar.Add(subBar)
+				}
+				multiBar.PrefixesAlign()
+				innerErr := processFile(temp, outPath, subBar)
+				if innerErr != nil {
+					subBar.WriteAbove(formatAbove(innerErr.Error()))
+				} else {
+					subBar.WriteAbove(formatAbove("finished."))
+					subBar.Progress(100)
+				}
+			})
 			if err != nil {
 				return err
 			}
-			for _, entry := range entries {
-				if !entry.IsDir() {
-					files = append(files, path.Join(srcPath, entry.Name()))
-				}
-			}
-		} else {
-			files = append(files, srcPath)
 		}
-		for _, file := range files {
-			if err := processFile(file, outPath); err != nil {
-				return err
-			}
-		}
+		wg.Wait()
 		return nil
 	},
+}
+
+func formatPrefix(prefix string) string {
+	if len([]rune(prefix)) > maxPrefixLength {
+		prefix = fmt.Sprintf("%s...", string([]rune(prefix)[:maxPrefixLength-3]))
+	}
+	return prefix
+}
+
+func formatAbove(text string) string {
+	return fmt.Sprintf("\t\t\t\t%s", text)
 }
 
 func getSrcPath(pwd string) (string, os.FileInfo, error) {
@@ -94,24 +143,43 @@ func getOutPath(pwd, srcPath string, srcInfo os.FileInfo) (string, error) {
 	return out, nil
 }
 
-func processFile(filePath, outPath string) error {
-	fmt.Printf("processing %s...\n", filePath)
+func getFiles(srcPath string, srcInfo os.FileInfo) ([]string, error) {
+	var files []string
+	if srcInfo.IsDir() {
+		entries, err := os.ReadDir(srcPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				files = append(files, path.Join(srcPath, entry.Name()))
+			}
+		}
+	} else {
+		files = append(files, srcPath)
+	}
+	return files, nil
+}
+
+func processFile(filePath, outPath string, bar *progressbar.Bar) error {
+	bar.WriteAbove(formatAbove("unzipping..."))
 	outDir, err := unzipEpub(filePath, outPath)
 	if err != nil {
 		return err
 	}
 	defer func() {
+		bar.WriteAbove(formatAbove("cleaning..."))
 		_ = cleanFiles(outDir)
 	}()
-	err = processImages(path.Join(outDir, "images"))
+	err = processImages(path.Join(outDir, "images"), bar)
 	if err != nil {
 		return err
 	}
+	bar.WriteAbove(formatAbove("zipping..."))
 	return zipEpub(outDir)
 }
 
 func unzipEpub(filePath, outPath string) (string, error) {
-	fmt.Println("unzipping...")
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return "", err
@@ -157,20 +225,20 @@ func unzipEpub(filePath, outPath string) (string, error) {
 	return outDir, nil
 }
 
-func processImages(imagePath string) error {
+func processImages(imagePath string, bar *progressbar.Bar) error {
 	entries, err := os.ReadDir(imagePath)
 	if err != nil {
 		return err
 	}
-	bar := progressbar.Default(int64(len(entries)), "resizing")
-	defer func() {
-		_ = bar.Finish()
-	}()
-	for _, entry := range entries {
-		_ = bar.Add(1)
+	for i, entry := range entries {
+		progress := float64(i+1) / float64(len(entries)) * 100
+		if int(progress) <= 99 {
+			bar.Progress(progress)
+		}
 		if entry.IsDir() {
 			continue
 		}
+		bar.WriteAbove(formatAbove("resizing..."))
 		imgPath := path.Join(imagePath, entry.Name())
 		img, err := imaging.Open(imgPath)
 		if err != nil {
@@ -189,7 +257,6 @@ func processImages(imagePath string) error {
 }
 
 func zipEpub(dir string) error {
-	fmt.Println("zipping...")
 	info, err := os.Stat(dir)
 	if err != nil {
 		return err
@@ -257,7 +324,6 @@ func addFilesToZip(writer *zip.Writer, basePath, baseInZip string) error {
 }
 
 func cleanFiles(dir string) error {
-	fmt.Println("cleaning...")
 	return os.RemoveAll(dir)
 }
 
@@ -271,6 +337,7 @@ func init() {
 	rootCmd.Flags().StringVarP(&src, "src", "s", ".", "path of epub source file")
 	rootCmd.Flags().StringVarP(&out, "out", "o", "", "path of output file, default is src path")
 	rootCmd.Flags().Float64VarP(&ratio, "ratio", "r", 0.5, "ratio of epub file size")
+	rootCmd.Flags().IntVarP(&concurrency, "concurrency", "c", 1, "concurrency of process")
 }
 
 func main() {
