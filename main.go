@@ -171,7 +171,7 @@ func processFile(filePath, outPath string, bar *progressbar.Bar) error {
 		bar.WriteAbove(formatAbove("cleaning..."))
 		_ = cleanFiles(outDir)
 	}()
-	err = processImages(path.Join(outDir, "images"), bar)
+	err = processImages(outDir, bar)
 	if err != nil {
 		return err
 	}
@@ -226,34 +226,53 @@ func unzipEpub(filePath, outPath string) (string, error) {
 }
 
 func processImages(imagePath string, bar *progressbar.Bar) error {
-	entries, err := os.ReadDir(imagePath)
-	if err != nil {
-		return err
-	}
-	for i, entry := range entries {
-		progress := float64(i+1) / float64(len(entries)) * 100
+	bar.WriteAbove(formatAbove("scanning..."))
+	images := scanImages(imagePath)
+	for i, imagePath := range images {
+		progress := float64(i+1) / float64(len(images)) * 100
 		if int(progress) <= 99 {
 			bar.Progress(progress)
 		}
-		if entry.IsDir() {
-			continue
-		}
 		bar.WriteAbove(formatAbove("resizing..."))
-		imgPath := path.Join(imagePath, entry.Name())
-		img, err := imaging.Open(imgPath)
+		img, err := imaging.Open(imagePath)
 		if err != nil {
 			return err
 		}
-		err = os.Remove(path.Join(imagePath, entry.Name()))
+		err = os.Remove(imagePath)
 		if err != nil {
 			return err
 		}
-		err = imaging.Save(resizeImage(img), imgPath)
+		err = imaging.Save(resizeImage(img), imagePath)
 		if err != nil {
 			return err
 		}
 	}
+	if len(images) == 0 {
+		bar.Progress(99)
+	}
 	return nil
+}
+
+func scanImages(basePath string) []string {
+	info, err := os.Stat(basePath)
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	var imagePaths []string
+	entries, err := os.ReadDir(basePath)
+	if err != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			imagePaths = append(imagePaths, scanImages(path.Join(basePath, entry.Name()))...)
+			continue
+		}
+		if strings.HasSuffix(entry.Name(), ".jpg") || strings.HasSuffix(entry.Name(), ".jpeg") || strings.HasSuffix(entry.Name(), ".png") {
+			imagePaths = append(imagePaths, path.Join(basePath, entry.Name()))
+		}
+	}
+	return imagePaths
 }
 
 func zipEpub(dir string) error {
